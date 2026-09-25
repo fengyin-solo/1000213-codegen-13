@@ -18,10 +18,62 @@
       </article>
     </div>
 
+    <section class="flow-board">
+      <div class="flow-head">
+        <h3>剪辑版本流转台</h3>
+        <span class="flow-tip">按 待粗剪→粗剪中→待精剪→已交付 顺序流转，退回修改后列表、流转台与导出同步切换</span>
+      </div>
+      <div class="flow-stages">
+        <article v-for="stage in flowStages" :key="stage.stage" class="flow-column">
+          <header class="flow-column-head">
+            <strong>{{ stage.stage }}</strong>
+            <span class="flow-count">{{ stage.count }}</span>
+          </header>
+          <ul class="flow-items">
+            <li v-for="item in stage.items" :key="item.id" class="flow-item">
+              <span class="flow-task">{{ item.任务编号 }}</span>
+              <span class="flow-meta">{{ item.当前版本 }} · {{ item.status }} · 修改{{ item.修改轮次 }}轮</span>
+            </li>
+            <li v-if="!stage.items.length" class="flow-empty">暂无任务</li>
+          </ul>
+        </article>
+      </div>
+      <table class="data-table flow-log">
+        <thead>
+          <tr>
+            <th v-for="column in flowLogColumns" :key="column">{{ column }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="log in flowLogs" :key="log.序号">
+            <td>{{ log.时间 || '—' }}</td>
+            <td>{{ log.任务编号 }}</td>
+            <td>{{ log.操作人 }}</td>
+            <td>{{ log.动作 }}</td>
+            <td>{{ log.从状态 || '—' }} → {{ log.到状态 || '—' }}</td>
+            <td>{{ log.版本 || '—' }}</td>
+            <td>{{ log.交付日期 || '—' }}</td>
+            <td>{{ log.修改轮次 }}</td>
+          </tr>
+          <tr v-if="!flowLogs.length">
+            <td :colspan="flowLogColumns.length" class="empty-state">暂无流转记录，执行剪辑动作后在此展示</td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-if="flowError" class="error-text flow-error">{{ flowError }}</p>
+    </section>
+
     <form class="filter-bar" @submit.prevent="reload">
-      <label v-for="field in filterFields" :key="field" class="filter-item">
-        <span>{{ field }}</span>
-        <input v-model="filters[field]" :placeholder="`按${field}检索`" />
+      <label class="filter-item">
+        <span>任务编号</span>
+        <input v-model="keyword" placeholder="按任务编号检索" />
+      </label>
+      <label class="filter-item">
+        <span>剪辑状态</span>
+        <select v-model="statusFilter">
+          <option value="">全部状态</option>
+          <option v-for="status in statuses" :key="status" :value="status">{{ status }}</option>
+        </select>
       </label>
       <button class="btn" type="submit">查询</button>
       <button class="btn ghost" type="button" @click="resetFilters">重置条件</button>
@@ -63,26 +115,74 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 
 import { request } from '@/api/client'
+import { useSessionStore } from '@/stores/session'
 
 type Row = Record<string, string | number | null>
 
+interface FlowItem {
+  id: number
+  任务编号: string
+  所属集数: string
+  剪辑师: string
+  status: string
+  当前版本: string | null
+  修改轮次: number
+  交付日期: string | null
+}
+
+interface FlowStage {
+  stage: string
+  statuses: string[]
+  count: number
+  items: FlowItem[]
+}
+
+interface FlowLog {
+  序号: number
+  时间: string
+  任务编号: string
+  操作人: string
+  动作: string
+  从状态: string
+  到状态: string
+  版本: string
+  交付日期: string | null
+  修改轮次: number
+}
+
 const ENDPOINT = '/api/edit'
 const columns = ["任务编号", "所属集数", "剪辑师", "粗剪版本", "精剪版本", "交付日期", "修改轮次", "剪辑状态"]
-const actions = ["开始粗剪", "提交精剪", "确认交付"]
+const actions = ["开始粗剪", "提交精剪", "确认交付", "退回修改", "恢复上一版"]
 const statuses = ["待粗剪", "粗剪中", "待精剪", "已交付"]
-const stats = [{"label": "待粗剪任务", "value": 0}, {"label": "精剪中任务", "value": 0}, {"label": "已交付集数", "value": 0}]
+const flowLogColumns = ["时间", "任务编号", "操作人", "动作", "状态流转", "版本", "交付日期", "修改轮次"]
+
+const session = useSessionStore()
 
 const rows = ref<Row[]>([])
 const total = ref(0)
 const errorMessage = ref('')
-const filters = ref<Record<string, string>>({})
-const filterFields = columns.slice(0, 3)
+const keyword = ref('')
+const statusFilter = ref('')
+const flowStages = ref<FlowStage[]>([])
+const flowLogs = ref<FlowLog[]>([])
+const flowError = ref('')
+
+const stats = computed(() => [
+  { label: '粗剪阶段任务', value: stageCount('粗剪') },
+  { label: '精剪阶段任务', value: stageCount('精剪') },
+  { label: '已交付集数', value: stageCount('交付') },
+])
+
+function stageCount(stage: string): number {
+  return flowStages.value.find((item) => item.stage === stage)?.count ?? 0
+}
 
 function resetFilters() {
-  filters.value = {}
+  keyword.value = ''
+  statusFilter.value = ''
   void reload()
 }
 
@@ -99,12 +199,14 @@ async function runAction(action: string, row: Row) {
   try {
     const response = await request(`${ENDPOINT}/${row.id}/actions`, {
       method: 'POST',
-      body: JSON.stringify({ action }),
+      body: JSON.stringify({ values: { action, 操作人: session.operator } }),
     })
-    if (!response.ok) {
-      throw new Error('后期剪辑动作未生效，请稍后重试')
+    const payload: { ok?: boolean; message?: string } | null = await response.json().catch(() => null)
+    if (!response.ok || !payload?.ok) {
+      throw new Error(payload?.message ?? '后期剪辑动作未生效，请稍后重试')
     }
-    await reload()
+    // 列表与流转台读的是同一份数据，动作生效后一起刷新，保证同步切换
+    await Promise.all([reload(), reloadFlow()])
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '后期剪辑操作失败'
   }
@@ -112,9 +214,15 @@ async function runAction(action: string, row: Row) {
 
 async function reload() {
   errorMessage.value = ''
-  const query = new URLSearchParams(filters.value as Record<string, string>).toString()
+  const query = new URLSearchParams()
+  if (keyword.value) {
+    query.set('keyword', keyword.value)
+  }
+  if (statusFilter.value) {
+    query.set('status', statusFilter.value)
+  }
   try {
-    const response = await request(`${ENDPOINT}?${query}`)
+    const response = await request(`${ENDPOINT}?${query.toString()}`)
     if (!response.ok) {
       throw new Error('剪辑任务列表读取失败')
     }
@@ -122,9 +230,48 @@ async function reload() {
     rows.value = payload.items ?? []
     total.value = payload.total ?? rows.value.length
   } catch (error) {
+    // 读取失败时保留上一版列表数据，只提示原因
     errorMessage.value = error instanceof Error ? error.message : '后期剪辑列表读取失败'
   }
 }
 
-onMounted(reload)
+async function reloadFlow() {
+  flowError.value = ''
+  try {
+    const response = await request(`${ENDPOINT}/flow`)
+    if (!response.ok) {
+      throw new Error('剪辑版本流转台读取失败')
+    }
+    const payload = await response.json()
+    flowStages.value = payload.stages ?? []
+    flowLogs.value = (payload.logs ?? []).slice(0, 10)
+  } catch (error) {
+    // 读取失败时保留上一版流转台数据，只提示原因
+    flowError.value = error instanceof Error ? error.message : '剪辑版本流转台读取失败'
+  }
+}
+
+onMounted(() => {
+  void reload()
+  void reloadFlow()
+})
 </script>
+
+<style scoped>
+.flow-board { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+.flow-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 10px; }
+.flow-head h3 { margin: 0; font-size: 14px; }
+.flow-tip { color: var(--muted); font-size: 12px; }
+.flow-stages { display: flex; gap: 10px; margin-bottom: 10px; }
+.flow-column { flex: 1; border: 1px solid var(--border); border-radius: 6px; padding: 8px; background: #f8fafc; }
+.flow-column-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+.flow-count { background: var(--brand); color: #fff; border-radius: 10px; padding: 0 8px; font-size: 12px; }
+.flow-items { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.flow-item { background: #fff; border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; display: flex; flex-direction: column; }
+.flow-task { font-size: 13px; }
+.flow-meta { color: var(--muted); font-size: 12px; }
+.flow-empty { color: var(--muted); font-size: 12px; text-align: center; padding: 6px 0; }
+.flow-log th, .flow-log td { font-size: 12px; }
+.flow-error { margin: 8px 0 0; }
+.filter-item select { padding: 4px 8px; }
+</style>
